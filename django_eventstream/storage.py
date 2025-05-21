@@ -47,6 +47,13 @@ class StorageBase(object):
 
     def get_current_id(self, channel):
         raise NotImplementedError()
+    
+LUA_SCRIPT_APPEND_EVENT_BODY = """
+local numeric_id = redis.call('INCR', KEYS[1])
+local event_data_key = KEYS[2] .. numeric_id
+redis.call('SETEX', event_data_key, ARGV[2], ARGV[1])
+return numeric_id
+"""
 
 
 class RedisStorage(StorageBase):
@@ -116,19 +123,33 @@ class RedisStorage(StorageBase):
         Returns:
             Event: An Event object representing the appended event.
         """
-        with self.redis.pipeline() as pipe:
-            try:
-                event_id = pipe.incr("event_counter:" + channel)
-                event_data = json.dumps({"type": event_type, "data": data})
-                pipe.setex(
-                    "event:" + channel + ":" + str(event_id),
-                    EVENT_TIMEOUT * 60,
-                    event_data,
-                )
-                pipe.execute()
-                return Event(channel, event_type, data, id=event_id)
-            except ConnectionError as e:
-                raise ConnectionError("Failed to append event to Redis.") from e
+        
+        event_payload_to_store = json.dumps(
+            {"type": event_type, "data": data},
+            cls=DjangoJSONEncoder # Handles Django-specific types like datetime
+        )
+
+        data_for_event_object = data
+
+        counter_key = f"event_counter:{channel}"
+        event_key_prefix = f"event:{channel}:"
+
+        numeric_id = self.redis.eval(
+            LUA_SCRIPT_APPEND_EVENT_BODY,
+            2,
+            counter_key,
+            event_key_prefix,
+            event_payload_to_store,
+            24 * 60 * 60, # 24 hours in seconds
+        )
+
+        return Event(
+            channel=channel,
+            type=event_type,
+            data=data_for_event_object,
+            id=int(numeric_id)
+        )
+        
 
     def get_events(self, channel: str, last_id: int, limit: int = 100):
         """
